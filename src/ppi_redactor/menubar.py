@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shlex
+import subprocess
 import threading
 import time
 
@@ -11,29 +13,52 @@ from .redactor import available_labels, load_model, redact
 
 POLL_INTERVAL_S = 0.3
 APP_NAME = "PPI Redactor"
+ICON_IDLE = "🛡"
+ICON_REDACTED = "✂️"
+ICON_FLASH_S = 1.5
+
+# Known label set for openai/privacy-filter. Populated eagerly so the Labels
+# submenu is interactive before the model finishes loading. Refreshed from
+# the model's id2label after load in case the set ever changes.
+KNOWN_LABELS = [
+    "account_number",
+    "private_address",
+    "private_date",
+    "private_email",
+    "private_person",
+    "private_phone",
+    "private_url",
+    "secret",
+]
 
 
 class RedactorApp(rumps.App):
     def __init__(self) -> None:
-        super().__init__(APP_NAME, title="🛡", quit_button=None)
+        super().__init__(APP_NAME, title=ICON_IDLE, quit_button=None)
 
         self._cfg_lock = threading.Lock()
         self.cfg = Config.load()
 
-        # Lazy-loaded; first clipboard change triggers the load.
         self._model = None
         self._tokenizer = None
-        self._labels: list[str] = []
         self._model_lock = threading.Lock()
 
         self._pause_item = rumps.MenuItem("Pause redaction", callback=self._toggle_pause)
         self._pause_item.state = 1 if self.cfg.paused else 0
 
+        # Build the Labels submenu eagerly so it's interactive at launch.
+        # rumps locks a submenu as disabled if it has no children when first
+        # rendered, so we MUST add items before assigning self.menu.
         self._labels_menu = rumps.MenuItem("Labels")
         self._label_items: dict[str, rumps.MenuItem] = {}
+        enabled = set(self.cfg.enabled_labels)
+        for label in KNOWN_LABELS:
+            item = rumps.MenuItem(label, callback=self._make_label_toggler(label))
+            item.state = 1 if label in enabled else 0
+            self._labels_menu.add(item)
+            self._label_items[label] = item
 
-        self._status_item = rumps.MenuItem("Last: (idle)")
-        self._status_item.set_callback(None)
+        self._status_item = rumps.MenuItem("Last: loading model…")
 
         self.menu = [
             self._pause_item,
@@ -44,36 +69,26 @@ class RedactorApp(rumps.App):
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
 
-        # Loading the model takes a while — kick it off in a background thread
-        # so the menubar icon appears immediately.
         threading.Thread(target=self._ensure_model, daemon=True).start()
         threading.Thread(target=self._clipboard_loop, daemon=True).start()
 
     # ----- model loading -----
 
-    def _ensure_model(self) -> tuple[object, object]:
+    def _ensure_model(self):
         with self._model_lock:
             if self._model is None:
-                self._status("Loading model…")
                 model, tokenizer = load_model()
                 self._model = model
                 self._tokenizer = tokenizer
-                self._labels = available_labels(model)
-                # Build the Labels submenu on the main thread via rumps timer.
-                rumps.Timer(self._populate_labels_once, 0.01).start()
-                self._status("Ready")
+                # Add any labels the model exposes that we didn't hardcode.
+                actual = set(available_labels(model))
+                for label in sorted(actual - set(self._label_items)):
+                    item = rumps.MenuItem(label, callback=self._make_label_toggler(label))
+                    item.state = 1 if label in set(self.cfg.enabled_labels) else 0
+                    self._labels_menu.add(item)
+                    self._label_items[label] = item
+                self._status("ready")
             return self._model, self._tokenizer
-
-    def _populate_labels_once(self, sender) -> None:
-        sender.stop()
-        if self._label_items:
-            return
-        enabled = set(self.cfg.enabled_labels)
-        for label in self._labels:
-            item = rumps.MenuItem(label, callback=self._make_label_toggler(label))
-            item.state = 1 if label in enabled else 0
-            self._labels_menu.add(item)
-            self._label_items[label] = item
 
     # ----- menu callbacks -----
 
@@ -82,7 +97,7 @@ class RedactorApp(rumps.App):
             self.cfg.paused = not self.cfg.paused
             sender.state = 1 if self.cfg.paused else 0
             self.cfg.save()
-        self._status("Paused" if self.cfg.paused else "Resumed")
+        self._status("paused" if self.cfg.paused else "resumed")
 
     def _make_label_toggler(self, label: str):
         def toggle(sender) -> None:
@@ -103,7 +118,6 @@ class RedactorApp(rumps.App):
     def _clipboard_loop(self) -> None:
         pb = NSPasteboard.generalPasteboard()
         last_change = pb.changeCount()
-        # Track our own writes so we don't reprocess them.
         self_write_count = -1
 
         while True:
@@ -143,24 +157,50 @@ class RedactorApp(rumps.App):
 
                 unique = sorted({s.label for s in spans if s.label})
                 summary = ", ".join(unique) if unique else "?"
-                self._status(f"Redacted {len(spans)} span(s): {summary}")
-                try:
-                    rumps.notification(
-                        APP_NAME,
-                        f"Redacted {len(spans)} span(s)",
-                        summary,
-                    )
-                except Exception:
-                    # Notifications require a bundled .app on recent macOS;
-                    # fall back silently when running via `uv run`.
-                    pass
-            except Exception as e:  # don't let the loop die
-                self._status(f"Error: {e}")
+                self._status(f"redacted {len(spans)} span(s): {summary}")
+                self._flash_icon(len(spans))
+                _notify(f"Redacted {len(spans)} span(s)", summary)
+            except Exception as e:
+                self._status(f"error: {e}")
 
     # ----- helpers -----
 
     def _status(self, msg: str) -> None:
         self._status_item.title = f"Last: {msg}"
+
+    def _flash_icon(self, n: int) -> None:
+        """Briefly change the menubar title so redaction is visible without notifs."""
+        self.title = f"{ICON_REDACTED} {n}"
+
+        def restore():
+            self.title = ICON_IDLE
+        t = threading.Timer(ICON_FLASH_S, restore)
+        t.daemon = True
+        t.start()
+
+
+def _notify(title: str, message: str) -> None:
+    """Show a macOS notification via osascript.
+
+    rumps.notification requires a bundled .app; osascript works from any
+    process (shows under 'Script Editor' identity). Best-effort — silently
+    swallows failures so the redaction loop never dies on a notif issue.
+    """
+    try:
+        script = (
+            f'display notification {shlex.quote(message)} '
+            f'with title {shlex.quote(APP_NAME)} '
+            f'subtitle {shlex.quote(title)}'
+        )
+        subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            timeout=2,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 def main() -> int:
